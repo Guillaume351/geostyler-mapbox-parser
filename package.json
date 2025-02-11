@@ -4,6 +4,13 @@
   "description": "GeoStyler-Style-Parser implementation for Mapbox",
   "type": "module",
   "main": "dist/MapboxStyleParser.js",
+  "exports": {
+    ".": {
+      "types": "./dist/MapboxStyleParser.d.ts",
+      "import": "./dist/MapboxStyleParser.js",
+      "require": "./dist/MapboxStyleParser.js"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/geostyler/geostyler-mapbox-parser.git"
