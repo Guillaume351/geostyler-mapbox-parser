@@ -7,7 +7,7 @@ import {
   PropertyType,
   isGeoStylerFunction,
 } from "geostyler-style";
-import lodash from "lodash";
+import { invert } from "lodash-es";
 import {
   ExpressionName,
   Expression as MapboxExpression,
@@ -183,7 +183,7 @@ const functionNameMap: Record<
 
 const invertedFunctionNameMap: Partial<
   Record<ExpressionName, GeoStylerFunction["name"]>
-> = lodash.invert(functionNameMap);
+> = invert(functionNameMap);
 
 export function gs2mbExpression<T extends PropertyType>(
   gsExpression?: GeoStylerExpression<T>
