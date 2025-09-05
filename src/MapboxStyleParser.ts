@@ -151,7 +151,7 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
         outlineWidthUnit: 'none',
         graphicFill: {
           support: 'partial',
-          info: 'Only Sprite is supported.'
+          info: 'Sprite icons and Mark shape://horline|shape://vertline supported as patterns.'
         }
       },
       LineSymbolizer: {
@@ -170,7 +170,7 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
         support: 'partial',
         wellKnownName: {
           support: 'partial',
-          info: 'Only circle symbolizers are supported for the moment.'
+          info: 'circle and shape://horline|shape://vertline (as fill patterns).'
         },
         opacity: {
           support: 'none',
@@ -236,6 +236,57 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
   private mbMetadata: {
     'geostyler:ref': GeoStylerRef;
   };
+
+  // Helpers for Mark-based line hatch patterns (graphicFill)
+  private isSupportedLinePattern(mark?: MarkSymbolizer): boolean {
+    if (!mark) return false;
+    if (mark.kind !== 'Mark') return false;
+    const name = (mark.wellKnownName || '').toLowerCase();
+    return name === 'shape://horline' || name === 'shape://vertline';
+  }
+
+  private computePatternSize(mark: MarkSymbolizer): number {
+    const w = typeof mark.strokeWidth === 'number' ? mark.strokeWidth : 1;
+    const suggested = Math.round(w * 8);
+    // clamp to [16, 64], default 24 when undefined
+    return Math.min(64, Math.max(16, suggested || 24));
+  }
+
+  // Simple djb2 hash for stable id generation (browser-safe)
+  private hashString(input: string): string {
+    let hash = 5381;
+    for (let i = 0; i < input.length; i++) {
+      hash = ((hash << 5) + hash) + input.charCodeAt(i);
+      hash = hash & 0xffffffff;
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  private getGraphicFillLinePatternSpec(mark: MarkSymbolizer): { id: string; spec: any } | undefined {
+    if (!this.isSupportedLinePattern(mark)) return undefined;
+    const orientation = (mark.wellKnownName || '').toLowerCase();
+    const strokeColor = typeof mark.strokeColor === 'string' ? mark.strokeColor : '#000000';
+    const strokeOpacity = typeof mark.strokeOpacity === 'number' ? mark.strokeOpacity : 1;
+    const strokeWidth = typeof mark.strokeWidth === 'number' ? mark.strokeWidth : 1;
+    const rotate = typeof mark.rotate === 'number' ? mark.rotate : 0;
+    const patternSize = this.computePatternSize(mark);
+
+    const key = JSON.stringify({ t: 'line', o: orientation, c: strokeColor, a: strokeOpacity, w: strokeWidth, r: rotate, s: patternSize });
+    const id = `gs-gf-line-${this.hashString(key)}`;
+
+    return {
+      id,
+      spec: {
+        type: 'line',
+        id,
+        strokeColor,
+        strokeOpacity,
+        strokeWidth,
+        rotate,
+        patternSize
+      }
+    };
+  }
 
   private gsMetadata: {
     'mapbox:ref': MapboxRef;
@@ -1059,6 +1110,34 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
         symbolizers: []
       };
 
+      // Determine base defaults for line symbolizers in this rule
+      let baseLinePaint: Partial<LinePaint> | undefined;
+      let baseLineLayout: Partial<LineLayout> | undefined;
+      for (const s of rule.symbolizers) {
+        if (s.kind === 'Line') {
+          const p = this.getPaintFromLineSymbolizer(s as LineSymbolizer);
+          const l = this.getLayoutFromLineSymbolizer(s as LineSymbolizer);
+          const hasStroke = (p && (p['line-color'] !== undefined || p['line-width'] !== undefined || p['line-opacity'] !== undefined));
+          const hasLayout = (l && (l['line-cap'] !== undefined || l['line-join'] !== undefined));
+          if (hasStroke && !baseLinePaint) {
+            baseLinePaint = {
+              'line-color': p['line-color'],
+              'line-width': p['line-width'],
+              'line-opacity': p['line-opacity']
+            };
+          }
+          if (hasLayout && !baseLineLayout) {
+            baseLineLayout = {
+              'line-cap': l['line-cap'],
+              'line-join': l['line-join']
+            };
+          }
+          if (baseLinePaint && baseLineLayout) {
+            break;
+          }
+        }
+      }
+
       rule.symbolizers.forEach((symbolizer: Symbolizer, symbolizerIndex: number) => {
         // use existing layer properties
         let lyr: any = {};
@@ -1074,9 +1153,37 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
         );
 
         styles.forEach((style: any, styleIndex: number) => {
-          const {
+          let {
             type, paint, layout
           } = style;
+
+          // If we emit a line layer that lacks basic stroke/layout props,
+          // propagate from the base defaults determined for this rule.
+          if (type === 'line') {
+            const p: any = paint || {};
+            const l: any = layout || {};
+            if (baseLinePaint) {
+              if (p['line-color'] === undefined && baseLinePaint['line-color'] !== undefined) {
+                p['line-color'] = baseLinePaint['line-color'];
+              }
+              if (p['line-width'] === undefined && baseLinePaint['line-width'] !== undefined) {
+                p['line-width'] = baseLinePaint['line-width'];
+              }
+              if (p['line-opacity'] === undefined && baseLinePaint['line-opacity'] !== undefined) {
+                p['line-opacity'] = baseLinePaint['line-opacity'];
+              }
+            }
+            if (baseLineLayout) {
+              if (l['line-cap'] === undefined && baseLineLayout['line-cap'] !== undefined) {
+                l['line-cap'] = baseLineLayout['line-cap'];
+              }
+              if (l['line-join'] === undefined && baseLineLayout['line-join'] !== undefined) {
+                l['line-join'] = baseLineLayout['line-join'];
+              }
+            }
+            paint = p;
+            layout = l;
+          }
 
           let lyrClone = structuredClone(lyr);
 
@@ -1095,6 +1202,22 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
             lyrClone.layout = layout;
           }
           lyrClone.id = `r${ruleIndex}_sy${symbolizerIndex}_st${styleIndex}`;
+
+          // Attach metadata for runtime pattern registration when using Mark-based line hatch
+          try {
+            if (type === 'fill' && symbolizer.kind === 'Fill') {
+              const gf = (symbolizer as FillSymbolizer).graphicFill as any;
+              if (gf && gf.kind === 'Mark' && this.isSupportedLinePattern(gf as MarkSymbolizer)) {
+                const spec = this.getGraphicFillLinePatternSpec(gf as MarkSymbolizer);
+                if (spec) {
+                  lyrClone.metadata = lyrClone.metadata || {};
+                  set(lyrClone, ['metadata', 'geostylerGraphicFill'], spec.spec);
+                }
+              }
+            }
+          } catch (e) {
+            // be defensive: do not break layer emission on metadata errors
+          }
 
           const sourceMapping = this.gsMetadata['mapbox:ref']?.sourceMapping;
           if (sourceMapping) {
@@ -1261,17 +1384,24 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
         layout = this.getLayoutFromTextSymbolizer(symbolizerClone as TextSymbolizer);
         break;
       case 'Mark':
-        if (symbolizer.wellKnownName === 'circle') {
-          type = 'circle';
-          paint = this.getCirclePaintFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
-          layout = this.getCircleLayoutFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
+        {
+          const wkn = (symbolizer.wellKnownName || '').toLowerCase();
+          // Support common marks: circle; gracefully map other basic shapes to circle
+          const supportedBasicMarks = ['circle', 'square', 'triangle'];
+          if (supportedBasicMarks.includes(wkn)) {
+            type = 'circle';
+            paint = this.getCirclePaintFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
+            layout = this.getCircleLayoutFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
+          } else if (!this.ignoreConversionErrors) {
+            // Fallback: map unknown mark shapes to circle to avoid hard failure
+            type = 'circle';
+            paint = this.getCirclePaintFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
+            layout = this.getCircleLayoutFromMarkSymbolizer(symbolizerClone as MarkSymbolizer);
+          } else {
+            type = 'symbol';
+          }
           break;
-        } else if (!this.ignoreConversionErrors) {
-          throw new Error('Cannot get Style. Unsupported MarkSymbolizer');
-        } else {
-          type = 'symbol';
         }
-        break;
       // TODO check if mapbox can generate regular shapes
       default:
         if (!this.ignoreConversionErrors) {
@@ -1346,12 +1476,21 @@ export class MapboxStyleParser implements StyleParser<Omit<MbStyle, 'sources'>> 
       antialias
     } = symbolizer;
 
+    // Resolve pattern name for Mark-based line hatches or icon-based patterns
+    let resolvedPattern: string | undefined;
+    if (graphicFill && (graphicFill as any).kind === 'Mark' && this.isSupportedLinePattern(graphicFill as MarkSymbolizer)) {
+      const res = this.getGraphicFillLinePatternSpec(graphicFill as MarkSymbolizer);
+      resolvedPattern = res?.id;
+    } else {
+      resolvedPattern = this.getPatternOrGradientFromPointSymbolizer(graphicFill);
+    }
+
     const paint: FillPaint = {
       'fill-antialias': gs2mbExpression<boolean>(antialias),
       'fill-opacity': gs2mbExpression<number>(opacity),
       'fill-color': gs2mbExpression<string>(color),
       'fill-outline-color': gs2mbExpression<string>(outlineColor),
-      'fill-pattern': this.getPatternOrGradientFromPointSymbolizer(graphicFill)
+      'fill-pattern': resolvedPattern
     };
     if (!!graphicFill && this.replaceGraphicFillWithColor && !paint['fill-color']) {
       if (graphicFill.kind === 'Mark') {
